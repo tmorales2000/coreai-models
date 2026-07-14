@@ -64,6 +64,13 @@ class VLMSpec:
     image_mean: tuple[float, float, float]
     image_std: tuple[float, float, float]
     rescale_factor: float
+    preprocessing: str = "stretch"
+    """Image preprocessing strategy emitted to metadata.json ``vision.preprocessing``.
+
+    Consumed by ``CoreAISequentialVLMEngine`` to select the resize algorithm:
+    - ``"stretch"`` — stretch-resize to ``image_size × image_size`` (legacy default).
+    - ``"center_crop"`` — shortest-edge resize then center-crop (CLIP-based towers).
+    """
 
     @property
     def num_visual_tokens(self) -> int:
@@ -378,6 +385,7 @@ async def export_text_bundle(
             "image_mean": list(spec.image_mean),
             "image_std": list(spec.image_std),
             "rescale_factor": spec.rescale_factor,
+            "preprocessing": spec.preprocessing,
         },
         "source": {
             "hf_model_id": spec.hf_model_id,

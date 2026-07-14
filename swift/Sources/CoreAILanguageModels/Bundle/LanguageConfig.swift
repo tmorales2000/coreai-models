@@ -169,6 +169,29 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Pixel rescale factor applied before normalization. Defaults to 1.0 when omitted.
     public let rescaleFactor: Double
 
+    /// How the engine resizes the input image before passing it to the vision encoder.
+    /// Declared in the `vision` block of `metadata.json` as `"preprocessing"`.
+    /// Defaults to `.stretch` when absent for backward compatibility.
+    public let preprocessingStrategy: PreprocessingStrategy
+
+    /// Image preprocessing strategy for the vision encoder input.
+    ///
+    /// `CoreAISequentialVLMEngine` reads this value and calls the corresponding
+    /// method on `ImagePreprocessor`:
+    /// - `.stretch` → `ImagePreprocessor.preprocessCHW(cgImage:)`
+    /// - `.centerCrop` → `ImagePreprocessor.preprocessCHWCenterCrop(cgImage:)`
+    public enum PreprocessingStrategy: String, Codable, Sendable, Equatable {
+        /// Resize shortest edge to `imageSize`, then center-crop to `imageSize × imageSize`.
+        /// Matches `CLIPImageProcessor(size={"shortest_edge": N}, crop_size=N×N)`.
+        /// Correct for FastVLM and any CLIP-based vision tower.
+        case centerCrop = "center_crop"
+
+        /// Stretch-resize to `imageSize × imageSize`, filling the target rect completely.
+        /// Distorts aspect ratio for non-square images. Legacy default — used when
+        /// `"preprocessing"` is absent from `metadata.json`.
+        case stretch = "stretch"
+    }
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -180,7 +203,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         imageTokenId: Int32,
         imageMean: [Double]? = nil,
         imageStd: [Double]? = nil,
-        rescaleFactor: Double? = nil
+        rescaleFactor: Double? = nil,
+        preprocessingStrategy: PreprocessingStrategy = .stretch
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -189,6 +213,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.imageMean = imageMean ?? Self.clipMean
         self.imageStd = imageStd ?? Self.clipStd
         self.rescaleFactor = rescaleFactor ?? 1.0
+        self.preprocessingStrategy = preprocessingStrategy
     }
 
     enum CodingKeys: String, CodingKey {
@@ -199,6 +224,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case imageMean = "image_mean"
         case imageStd = "image_std"
         case rescaleFactor = "rescale_factor"
+        case preprocessingStrategy = "preprocessing"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -210,5 +236,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.imageMean = try c.decodeIfPresent([Double].self, forKey: .imageMean) ?? Self.clipMean
         self.imageStd = try c.decodeIfPresent([Double].self, forKey: .imageStd) ?? Self.clipStd
         self.rescaleFactor = try c.decodeIfPresent(Double.self, forKey: .rescaleFactor) ?? 1.0
+        self.preprocessingStrategy = try c.decodeIfPresent(
+            PreprocessingStrategy.self, forKey: .preprocessingStrategy
+        ) ?? .stretch
     }
 }

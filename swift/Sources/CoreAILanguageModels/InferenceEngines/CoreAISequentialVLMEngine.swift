@@ -358,7 +358,13 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         guard let cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent) else {
             throw ImagePreprocessorError.renderFailed
         }
-        let chwPixels = try imagePreprocessor.preprocessCHW(cgImage: cgImage)
+        let chwPixels: [Float]
+        switch config.visionConfig.preprocessingStrategy {
+        case .centerCrop:
+            chwPixels = try imagePreprocessor.preprocessCHWCenterCrop(cgImage: cgImage)
+        case .stretch:
+            chwPixels = try imagePreprocessor.preprocessCHW(cgImage: cgImage)
+        }
 
         // Step 2: Run encode_image
         let encoderOutput = try await runVisionEncoder(pixels: chwPixels)

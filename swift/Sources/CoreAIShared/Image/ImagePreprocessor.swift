@@ -167,6 +167,121 @@ public struct ImagePreprocessor: Sendable {
         }
         return chw
     }
+
+    /// Preprocess a CGImage and return a flat CHW `[C, H, W]` Float32 array,
+    /// using shortest-edge resize followed by center crop to `targetSize × targetSize`.
+    ///
+    /// Matches `CLIPImageProcessor(size={"shortest_edge": N}, crop_size=N×N)`.
+    /// Correct for FastVLM and any CLIP-based vision tower. Preserves aspect ratio —
+    /// edge content may be cropped for strongly non-square images.
+    ///
+    /// `CoreAISequentialVLMEngine` calls this method when the model's
+    /// `VisionConfig.preprocessingStrategy` is `.centerCrop`.
+    public func preprocessCHWCenterCrop(cgImage: CGImage) throws -> [Float] {
+        let targetW = Int(targetSize.width)
+        let targetH = Int(targetSize.height)
+        let srcW = cgImage.width
+        let srcH = cgImage.height
+
+        // Scale so the shortest edge equals targetSize
+        let scale = max(
+            Double(targetW) / Double(srcW),
+            Double(targetH) / Double(srcH)
+        )
+        let scaledW = Int((Double(srcW) * scale).rounded())
+        let scaledH = Int((Double(srcH) * scale).rounded())
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+
+        // Render at scaled size
+        guard
+            let scaledCtx = CGContext(
+                data: nil,
+                width: scaledW,
+                height: scaledH,
+                bitsPerComponent: 8,
+                bytesPerRow: scaledW * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        scaledCtx.interpolationQuality = .high
+        scaledCtx.draw(cgImage, in: CGRect(x: 0, y: 0, width: scaledW, height: scaledH))
+
+        guard let scaledImage = scaledCtx.makeImage() else {
+            throw ImagePreprocessorError.renderFailed
+        }
+
+        // Center-crop to targetSize
+        let cropX = (scaledW - targetW) / 2
+        let cropY = (scaledH - targetH) / 2
+        guard let cropped = scaledImage.cropping(
+            to: CGRect(x: cropX, y: cropY, width: targetW, height: targetH)
+        ) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+
+        // Render cropped image and normalize — same pipeline as preprocess(cgImage:)
+        guard
+            let ctx = CGContext(
+                data: nil,
+                width: targetW,
+                height: targetH,
+                bitsPerComponent: 8,
+                bytesPerRow: targetW * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+
+        guard let pixelData = ctx.data else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        let rawPixels = pixelData.bindMemory(to: UInt8.self, capacity: targetW * targetH * 4)
+
+        let pixelCount = targetW * targetH
+        let bytesPerPixel = 4 * MemoryLayout<Float>.size
+        var data = Data(count: pixelCount * bytesPerPixel)
+        data.withUnsafeMutableBytes { dstPtr in
+            guard let dstBase = dstPtr.bindMemory(to: Float.self).baseAddress else { return }
+
+            let scale = Float(rescaleFactor) / 255.0
+            let means: [Float] = [Float(mean.0), Float(mean.1), Float(mean.2)]
+            let stds: [Float] = [Float(std.0), Float(std.1), Float(std.2)]
+
+            var channel = [Float](repeating: 0, count: pixelCount)
+            let n = vDSP_Length(pixelCount)
+            for c in 0..<3 {
+                var a = scale / stds[c]
+                var b = -means[c] / stds[c]
+                vDSP_vfltu8(rawPixels.advanced(by: c), 4, &channel, 1, n)
+                vDSP_vsmsa(channel, 1, &a, &b, dstBase.advanced(by: c), 4, n)
+            }
+
+            var zero: Float = 0
+            vDSP_vfill(&zero, dstBase.advanced(by: 3), 4, n)
+        }
+
+        // Transpose NHWC RGBA → planar CHW
+        var chw = [Float](repeating: 0, count: 3 * pixelCount)
+        data.withUnsafeBytes { rawSrc in
+            let src = rawSrc.bindMemory(to: Float.self)
+            for c in 0..<3 {
+                for i in 0..<pixelCount {
+                    chw[c * pixelCount + i] = src[i * 4 + c]
+                }
+            }
+        }
+        return chw
+    }
 }
 
 // MARK: - Errors
