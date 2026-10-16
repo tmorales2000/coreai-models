@@ -11,6 +11,9 @@ supported models are registered in its `SUPPORTED_MODELS` table.
 |------------|---------------------------|------------------------------------------|
 | `qwen3-vl` | `Qwen/Qwen3-VL-2B-Instruct` | 448×448 vision encoder, f16 text decoder |
 | `muse-glimmer-vl` | `meta-models/Muse-Glimmer-30B` | ViT-G/14 vision encoder, f16 text decoder |
+| `fastvlm-0.5b` | `apple/FastVLM-0.5B` | CLIP-based ViT vision encoder, f16 text decoder, 1024×1024 center-crop |
+| `fastvlm-1.5b` | `apple/FastVLM-1.5B` | CLIP-based ViT vision encoder, f16 text decoder, 1024×1024 center-crop |
+| `fastvlm-7b`   | `apple/FastVLM-7B`   | CLIP-based ViT vision encoder, f16 text decoder, 1024×1024 center-crop |
 
 ## Exporting
 

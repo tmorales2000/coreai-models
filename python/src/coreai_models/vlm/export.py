@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shutil
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,11 +35,13 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, Qwen2TokenizerFast
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
+from coreai_models.models.macos.fastvlm import FastVLMForCausalLMEmbeddings
+from coreai_models.models.macos.fastvlm_vision import FastVLMVisionModel
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
 from coreai_models.models.macos.muse_glimmer_vision import MuseGlimmerVisionModel
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
@@ -78,6 +81,48 @@ class VLMSpec:
 
 
 SUPPORTED_MODELS: dict[str, VLMSpec] = {
+    "fastvlm-0.5b": VLMSpec(
+        short_name="fastvlm-0.5b",
+        hf_model_id="apple/FastVLM-0.5B",
+        output_name="fastvlm_0_5b",
+        image_token_id=151646,  # <image> token — added to Qwen2 tokenizer during export
+        image_size=1024,
+        patch_size=64,  # conv_exp output stride: 1024 / 16 patches = 64
+        spatial_merge_size=1,  # FastViTHD has no spatial merge (vs Qwen's 2x merge)
+        temporal_patch_size=1,  # single image, no temporal axis
+        image_mean=(0.0, 0.0, 0.0),  # CLIP-style no-op normalization
+        image_std=(1.0, 1.0, 1.0),
+        rescale_factor=1.0,
+        image_strategy="center_crop",
+    ),
+    "fastvlm-1.5b": VLMSpec(
+        short_name="fastvlm-1.5b",
+        hf_model_id="apple/FastVLM-1.5B",
+        output_name="fastvlm_1_5b",
+        image_token_id=151646,
+        image_size=1024,
+        patch_size=64,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        image_mean=(0.0, 0.0, 0.0),
+        image_std=(1.0, 1.0, 1.0),
+        rescale_factor=1.0,
+        image_strategy="center_crop",
+    ),
+    "fastvlm-7b": VLMSpec(
+        short_name="fastvlm-7b",
+        hf_model_id="apple/FastVLM-7B",
+        output_name="fastvlm_7b",
+        image_token_id=151665,  # Qwen2-7B base vocab ends at 151664; <image> assigned 151665
+        image_size=1024,
+        patch_size=64,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        image_mean=(0.0, 0.0, 0.0),
+        image_std=(1.0, 1.0, 1.0),
+        rescale_factor=1.0,
+        image_strategy="center_crop",
+    ),
     "qwen3-vl": VLMSpec(
         short_name="qwen3-vl",
         hf_model_id="Qwen/Qwen3-VL-2B-Instruct",
@@ -138,10 +183,13 @@ def load_model_from_safetensors(
 ) -> torch.nn.Module:
     """Load a VL text decoder directly from safetensors, bypassing from_hf_memory_efficient.
 
-    Handles two checkpoint layouts:
+    Handles three checkpoint layouts:
       - Qwen3-VL: ``model.language_model.*`` (text), ``model.visual.*`` (vision, skipped)
       - Muse Glimmer: ``model.language_model.*`` (text), ``model.vision_*`` (vision, skipped),
         plus a top-level ``lm_head.weight`` outside the language_model prefix.
+      - FastVLM: ``model.layers.*`` / ``model.embed_tokens.*`` / ``lm_head.weight`` directly
+        (no ``model.language_model.`` wrapper); vision keys skipped via ``model.mm_projector.*``
+        and ``model.vision_projection.*``.
     """
     # Set config
     text_cfg = model_class._get_reauthored_config(hf_config, max_ctx, num_layers)
@@ -151,7 +199,15 @@ def load_model_from_safetensors(
     model.to(dtype=dtype)
 
     # Build state dict from safetensors
-    prefix = "model.language_model."
+    # Auto-detect prefix: FastVLM keys are already "model.*" with no
+    # "model.language_model." wrapper.
+    standard_prefix = "model.language_model."
+    st_files = _get_safetensors_files(model_dir)
+    with safe_open(st_files[0], framework="pt", device="cpu") as _f:
+        _sample_keys = [next(iter(_f.keys()))]  # just need one key
+    has_llm_prefix = any(k.startswith(standard_prefix) for k in _sample_keys)
+    prefix = standard_prefix if has_llm_prefix else ""
+
     # Prefixes to skip (vision components from various checkpoint formats)
     vision_prefixes = (
         "model.visual.",
@@ -160,7 +216,6 @@ def load_model_from_safetensors(
         "model.vision_projection.",
     )
     layer_pattern = re.compile(r"layers\.(\d+)\.")
-    st_files = _get_safetensors_files(model_dir)
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in st_files:
@@ -168,14 +223,24 @@ def load_model_from_safetensors(
             for key in f.keys():  # noqa: SIM118 — safe_open has no __iter__/__contains__
                 if any(key.startswith(vp) for vp in vision_prefixes):
                     continue
-                if key.startswith(prefix):
+                if prefix and key.startswith(prefix):
                     # Strip "model.language_model." → add "model."
                     stripped = key[len(prefix) :]
                     model_key = "model." + stripped
-                    # Skip layers beyond num_layers
                     m = layer_pattern.match(stripped)
                     if m and num_layers is not None and int(m.group(1)) >= num_layers:
                         continue
+                    tensor = f.get_tensor(key)
+                    if tensor.dtype not in (torch.float16, torch.int8) and "zero_point" not in key:
+                        tensor = tensor.to(dtype)
+                    state_dict[model_key] = tensor
+                elif not prefix and (key.startswith("model.") or key == "lm_head.weight"):
+                    # FastVLM: keys already in "model.*" / "lm_head.*" form
+                    model_key = key
+                    if key.startswith("model.layers."):
+                        m = layer_pattern.search(key)
+                        if m and num_layers is not None and int(m.group(1)) >= num_layers:
+                            continue
                     tensor = f.get_tensor(key)
                     if tensor.dtype not in (torch.float16, torch.int8) and "zero_point" not in key:
                         tensor = tensor.to(dtype)
@@ -260,12 +325,19 @@ class EmbedTokensNormed(torch.nn.Module):
 
 def _load_embed_weight(model_dir: str) -> torch.Tensor:
     """Read the f16 embed_tokens weight table [vocab, hidden] from safetensors."""
+    # FastVLM has no language_model wrapper — try both
     embed_key = "model.language_model.embed_tokens.weight"
+    fallback_key = "model.embed_tokens.weight"
     for path in _get_safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as f:
-            if embed_key in f.keys():  # noqa: SIM118 — safe_open has no __contains__
+            keys = f.keys()  # noqa: SIM118 — safe_open has no __contains__
+            if embed_key in keys:
                 return f.get_tensor(embed_key).to(torch.float16)
-    raise RuntimeError(f"embed_tokens not found in safetensors (looked for '{embed_key}')")
+            if fallback_key in keys:
+                return f.get_tensor(fallback_key).to(torch.float16)
+    raise RuntimeError(
+        f"embed_tokens not found in safetensors (looked for '{embed_key}' and '{fallback_key}')"
+    )
 
 
 async def export_embed_model(
@@ -344,8 +416,16 @@ async def export_text_bundle(
             "*.model",
         ],
     )
-    raw_cfg = AutoConfig.from_pretrained(model_dir)
-    text_cfg = raw_cfg.text_config
+    if spec.short_name.startswith("fastvlm-"):
+        # FastVLM config.json has hidden_size/vocab_size at the top level.
+        # Read directly to avoid trust_remote_code and a timm dependency.
+        with open(os.path.join(model_dir, "config.json")) as f:
+            _cfg_json = json.load(f)
+        raw_cfg = types.SimpleNamespace(**_cfg_json)
+        text_cfg = raw_cfg
+    else:
+        raw_cfg = AutoConfig.from_pretrained(model_dir)
+        text_cfg = raw_cfg.text_config
     hidden_size = text_cfg.hidden_size
     vocab_size = text_cfg.vocab_size
     logging.info(f"Text config: hidden={hidden_size}, vocab={vocab_size}, ctx={max_ctx}")
@@ -354,6 +434,8 @@ async def export_text_bundle(
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
     if spec.short_name == "muse-glimmer-vl":
         model_class = MuseGlimmerForCausalLMEmbeddings
+    elif spec.short_name.startswith("fastvlm-"):
+        model_class = FastVLMForCausalLMEmbeddings
     else:
         model_class = Qwen3VLForCausalLMEmbeddings
     model = load_model_from_safetensors(
@@ -444,7 +526,40 @@ async def export_text_bundle(
 
     # ---- 7. Tokenizer ----
     logging.info("Saving tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # effective_image_token_id: the ID written into metadata.json and used by the
+    # runner to locate the vision-embedding injection point.  For FastVLM we
+    # determine this dynamically (matching fastvlm-coreai's _setup_tokenizer
+    # approach) because the assigned ID depends on how many additional tokens the
+    # base checkpoint already has:
+    #   0.5b / 1.5b  vocab_size=151936, 3 pre-existing extras → <image>=151646
+    #   7b           vocab_size=152064, 22 pre-existing extras → <image>=151665
+    # Hardcoding the VLMSpec value would be wrong for whichever variant differs.
+    effective_image_token_id = spec.image_token_id
+    if spec.short_name.startswith("fastvlm-"):
+        # FastVLM uses a standard Qwen2 tokenizer; load directly to avoid
+        # trust_remote_code and a timm dependency.
+        tokenizer = Qwen2TokenizerFast.from_pretrained(model_dir)
+        # FastVLM's HF tokenizer does NOT register "<image>" as a special token.
+        # The runner tokenizes user prompts with this tokenizer and searches for
+        # image_token_id to locate where to inject vision embeddings.  Without
+        # registering "<image>", tokenizing it produces arbitrary BPE subword IDs
+        # — the runner never finds the injection point, no image embeddings are
+        # inserted, and the model generates text-only output.
+        _IMAGE_TOKEN = "<image>"
+        if _IMAGE_TOKEN not in tokenizer.get_vocab():
+            tokenizer.add_special_tokens({"additional_special_tokens": [_IMAGE_TOKEN]})
+        assigned_id = tokenizer.convert_tokens_to_ids(_IMAGE_TOKEN)
+        logging.info(f"FastVLM tokenizer: '{_IMAGE_TOKEN}' → ID {assigned_id}")
+        if assigned_id != spec.image_token_id:
+            logging.warning(
+                f"FastVLM tokenizer assigned '{_IMAGE_TOKEN}' ID {assigned_id} "
+                f"but VLMSpec.image_token_id={spec.image_token_id} for {spec.short_name}. "
+                f"Using dynamically assigned ID {assigned_id} in metadata.json. "
+                f"Consider updating image_token_id in SUPPORTED_MODELS to {assigned_id}."
+            )
+        effective_image_token_id = assigned_id
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
     tokenizer.save_pretrained(str(bundle_path / "tokenizer"))
 
     # ---- 8. metadata.json ----
@@ -470,7 +585,7 @@ async def export_text_bundle(
             "image_size": spec.image_size,
             "patch_size": spec.patch_size,
             "image_token_count": spec.num_visual_tokens,
-            "image_token_id": spec.image_token_id,
+            "image_token_id": effective_image_token_id,
             "image_mean": list(spec.image_mean),
             "image_std": list(spec.image_std),
             "rescale_factor": spec.rescale_factor,
@@ -729,9 +844,35 @@ async def export_vision_encoder(
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
 
     # ---- 1. Text hidden size (projection target) from the HF config ----
-    text_hidden = AutoConfig.from_pretrained(spec.hf_model_id).text_config.hidden_size
+    # FastVLM: read from config.json directly (no trust_remote_code, no text_config wrapper).
+    # Other models: read from AutoConfig.text_config.
+    # text_hidden is assigned in each branch below before use.
 
-    if spec.short_name == "muse-glimmer-vl":
+    if spec.short_name.startswith("fastvlm-"):
+        # FastVLM: FastViTHD vision encoder + MLP projector, single-image only.
+        if num_frames != 1:
+            raise NotImplementedError(
+                "FastVLM vision encoder supports single-image only "
+                f"(num_frames=1), got {num_frames}"
+            )
+        logging.info(f"Loading {spec.hf_model_id} vision encoder (FastVLMVisionModel)...")
+        model_dir = snapshot_download(
+            spec.hf_model_id,
+            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json", "*.py"],
+        )
+        with open(os.path.join(model_dir, "config.json")) as f:
+            raw_cfg = types.SimpleNamespace(**json.load(f))
+        text_hidden = raw_cfg.hidden_size
+        vision_model = FastVLMVisionModel.from_pretrained(
+            model_dir, config=raw_cfg, dtype=torch.float32
+        )
+        # FastVLMVisionModel.forward already returns [1, 256, hidden] in the
+        # target dtype — only the f16 cast wrapper is needed.
+        export_module = CastF16VisionEncoder(vision_model).eval()
+        num_visual_tokens = spec.num_visual_tokens
+        pixel_shape = (1, 3, spec.image_size, spec.image_size)
+
+    elif spec.short_name == "muse-glimmer-vl":
         # Muse Glimmer: use our standalone MuseGlimmerVisionModel which
         # handles 2D patchify, 2D RoPE, spatial merge, adapter, and
         # projection internally.  Single-image only (num_frames=1).
@@ -740,6 +881,7 @@ async def export_vision_encoder(
                 "Muse Glimmer vision encoder currently supports single-image only "
                 f"(num_frames=1), got {num_frames}"
             )
+        text_hidden = AutoConfig.from_pretrained(spec.hf_model_id).text_config.hidden_size
         logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
         vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
         # MuseGlimmerVisionModel.forward already returns [1, N, text_hidden]
@@ -750,6 +892,7 @@ async def export_vision_encoder(
     else:
         # Qwen3-VL: load HF model and wrap with StaticVisionEncoder for
         # Qwen's 3D patchify + rotary position embeddings.
+        text_hidden = AutoConfig.from_pretrained(spec.hf_model_id).text_config.hidden_size
         from transformers.models.qwen3_vl.modeling_qwen3_vl import (
             Qwen3VLForConditionalGeneration as HFModel,
         )

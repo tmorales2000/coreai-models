@@ -333,6 +333,59 @@ class Qwen3VLForCausalLMEmbeddings(BaseForCausalLM):
         out = self.model(inputs_embeds, position_ids, cache)
         return self.lm_head(out)
 
+    @classmethod
+    @override
+    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
+        """Override: Qwen3-VL embeddings decoder takes ``inputs_embeds``, not ``input_ids``.
+
+        The token embedding lookup lives in the separate embed.aimodel component,
+        so the decoder receives pre-computed embeddings.  The runner-visible input
+        name in the compiled bundle is ``inputs_embeds`` (not the base-class default
+        ``input_ids``).
+        """
+        from coreai_models._constants import MAIN_GRAPH_NAME
+
+        return {MAIN_GRAPH_NAME: ("inputs_embeds", "position_ids")}
+
+    @override
+    def build_reference_inputs(
+        self, config, target_dtype, spec
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        from coreai_models._constants import MAIN_GRAPH_NAME
+
+        hidden = config.hidden_size
+        n_layers = config.num_hidden_layers
+        n_kv = config.num_key_value_heads
+        head_dim = getattr(config, "head_dim", hidden // config.num_attention_heads)
+        max_ctx = getattr(spec, "cache_seq_len", config.max_position_embeddings)
+        qlen = getattr(spec, "query_len", 64)
+        offset = getattr(spec, "offset", 64)
+
+        return {
+            MAIN_GRAPH_NAME: {
+                "inputs_embeds": torch.randn(1, qlen, hidden, dtype=target_dtype),
+                "position_ids": torch.arange(qlen + offset, dtype=torch.int32).unsqueeze(0),
+                "k_cache": torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=target_dtype),
+                "v_cache": torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=target_dtype),
+            }
+        }
+
+    @override
+    def build_dynamic_shapes(self, config, spec) -> dict[str, dict]:
+        from coreai_models._constants import MAIN_GRAPH_NAME
+
+        max_ctx = getattr(spec, "cache_seq_len", config.max_position_embeddings)
+        qlen = getattr(spec, "query_len", 64)
+
+        return {
+            MAIN_GRAPH_NAME: {
+                "inputs_embeds": {1: torch.export.Dim("query_len", max=max_ctx - 2)},
+                "position_ids": {1: torch.export.Dim("seq_pos", min=qlen, max=max_ctx - 1)},
+                "k_cache": None,
+                "v_cache": None,
+            }
+        }
+
     @override
     def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
         # Normalize keys to "model.layers.N.*" form (same two-form handling as Qwen3VLForCausalLM)

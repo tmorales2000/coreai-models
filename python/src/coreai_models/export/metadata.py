@@ -325,6 +325,36 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     # ---- VLMs ----
+    "apple/FastVLM-0.5B": AIModelMetadataFields(
+        author="Apple",
+        license="apple-amlr",
+        model_description=(
+            "FastVLM 0.5B is a 0.5B-parameter vision-language model from Apple "
+            "using a FastViTHD image encoder optimized for efficient on-device "
+            "inference. "
+            "Source: https://huggingface.co/apple/FastVLM-0.5B"
+        ),
+    ),
+    "apple/FastVLM-1.5B": AIModelMetadataFields(
+        author="Apple",
+        license="apple-amlr",
+        model_description=(
+            "FastVLM 1.5B is a 1.5B-parameter vision-language model from Apple "
+            "using a FastViTHD image encoder optimized for efficient on-device "
+            "inference. "
+            "Source: https://huggingface.co/apple/FastVLM-1.5B"
+        ),
+    ),
+    "apple/FastVLM-7B": AIModelMetadataFields(
+        author="Apple",
+        license="apple-amlr",
+        model_description=(
+            "FastVLM 7B is a 7B-parameter vision-language model from Apple "
+            "using a FastViTHD image encoder optimized for efficient on-device "
+            "inference. "
+            "Source: https://huggingface.co/apple/FastVLM-7B"
+        ),
+    ),
     "Qwen/Qwen3-VL-2B-Instruct": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",

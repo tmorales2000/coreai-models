@@ -119,6 +119,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
     from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaEncoder
+    from coreai_models.models.macos.fastvlm import FastVLMForCausalLMEmbeddings
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
     from coreai_models.models.macos.gemma3n import Gemma3nForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
@@ -140,6 +141,12 @@ def _get_registry() -> dict[str, ModelEntry]:
         "diffusion_gemma_text": ModelEntry(
             macos_class=DiffusionGemmaEncoder,
             hf_config_attr="text_config",
+        ),
+        # FastVLM: LLaVA-style VLM with FastViTHD vision encoder + Qwen2 LLM.
+        # Flat config (no text_config sub-object); state dict prefixed with model.language_model.
+        "llava_qwen2": ModelEntry(
+            macos_class=FastVLMForCausalLMEmbeddings,
+            hf_state_dict_prefix="",
         ),
         "gemma3_text": ModelEntry(
             macos_class=Gemma3ForCausalLM,
